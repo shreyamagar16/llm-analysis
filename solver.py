@@ -7,163 +7,139 @@ from typing import Dict, Any, Optional
 import httpx
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-import math
-
-# optional: for PDF text extraction
+from urllib.parse import urljoin, urlparse, urlunparse
 try:
     from PyPDF2 import PdfReader
 except Exception:
     PdfReader = None
-
-# regex to find atob('...') with possible whitespace/newlines in the base64 literal
 ATOB_RE = re.compile(r'atob\(\s*[\'"](?P<b64>[A-Za-z0-9+/=\s]+)[\'"]\s*\)', re.MULTILINE)
-
+JSON_RE = re.compile(r"\{[\s\S]{2,10000}\}")
+URL_EXTRACT_RE = re.compile(r"https?://[^\s'\"<>]+")
+NUM_RE = re.compile(r"[-+]?\d*\.\d+|\d+")
 async def fetch_rendered_html(url: str, timeout: int = 60_000) -> str:
-    """
-    Use Playwright to open the page and return full HTML after JS executes.
-    """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         page = await browser.new_page()
         try:
             await page.goto(url, timeout=timeout)
-            # wait for network to be idle
             await page.wait_for_load_state("networkidle", timeout=timeout)
             content = await page.content()
         finally:
             await browser.close()
         return content
-
+def ensure_scheme(u: str) -> str:
+    u = u.strip()
+    p = urlparse(u)
+    if p.scheme:
+        return u
+    return "https://" + u
 def decode_atob_from_html(html: str) -> str:
-    """
-    find atob('....') in scripts and decode base64 payload (if present)
-    returns decoded string or empty.
-    """
-    # Prefer scanning <script> contents (safer) but fall back to whole html
     m = ATOB_RE.search(html)
     if not m:
-        return ""
-    b64 = m.group("b64")
-    # remove whitespace/newlines that sometimes appear inside JS string concatenation
-    b64 = "".join(b64.split())
+        scripts = "".join(re.findall(r"<script[\s\S]*?>[\s\S]*?</script>", html, flags=re.IGNORECASE))
+        m = ATOB_RE.search(scripts)
+        if not m:
+            return ""
+    b64 = "".join(m.group("b64").split())
     try:
-        decoded = base64.b64decode(b64).decode("utf8", errors="ignore")
-        return decoded
+        return base64.b64decode(b64).decode("utf8", errors="ignore")
     except Exception:
         return ""
-
-def extract_submit_url_from_text(text: str) -> str:
-    """
-    Heuristics: look for http(s) urls containing '/submit' or 'submit' in route
-    or look for any URL if none contain submit.
-    """
-    urls = re.findall(r"https?://[^\s'\"<>]+", text)
-    # prefer urls with 'submit' in them
-    for u in urls:
-        if "submit" in u.lower():
-            return u
-    return urls[0] if urls else ""
-
-def clean_link_candidate(link: str, base_url: str) -> str:
-    """
-    Resolve relative links and strip fragments.
-    """
-    if not link:
-        return ""
-    resolved = urljoin(base_url, link)
-    # strip fragments
-    pr = urlparse(resolved)
-    return pr._replace(fragment="").geturl()
-
-def _first_url_from_jsonlike(text: str) -> Optional[str]:
-    """Try to parse JSON-like object and return common submit/url values."""
-    m = re.search(r"\{[\s\S]{20,5000}\}", text)
+def extract_json_from_text(text: str) -> Optional[dict]:
+    m = JSON_RE.search(text)
     if not m:
         return None
     try:
-        obj = json.loads(m.group(0))
+        return json.loads(m.group(0))
     except Exception:
-        return None
-    for k in ("submit", "submit_url", "url", "endpoint"):
-        if k in obj:
-            return obj.get(k)
-    return None
-
-async def _fetch_text_via_httpx(client: httpx.AsyncClient, url: str, timeout: int = 30) -> str:
+        try:
+            cleaned = m.group(0).replace("\n", " ")
+            return json.loads(cleaned)
+        except Exception:
+            return None
+def find_submit_url(text: str, base: Optional[str] = None) -> str:
+    urls = URL_EXTRACT_RE.findall(text)
+    for u in urls:
+        if "/submit" in u.lower() or "submit" in u.lower():
+            return u
+    if urls:
+        return urls[0]
+    if base:
+        return base
+    return ""
+async def _fetch_text(client: httpx.AsyncClient, url: str, timeout: int = 30) -> str:
     r = await client.get(url, timeout=timeout)
     r.raise_for_status()
     return r.text
-
-async def _fetch_bytes_via_httpx(client: httpx.AsyncClient, url: str, timeout: int = 30) -> bytes:
+async def _fetch_bytes(client: httpx.AsyncClient, url: str, timeout: int = 30) -> bytes:
     r = await client.get(url, timeout=timeout)
     r.raise_for_status()
     return r.content
-
 def sum_numbers_from_text(text: str) -> Optional[float]:
-    """
-    Find numbers in text and return their sum (basic heuristic).
-    """
-    nums = re.findall(r"[-+]?\d*\.\d+|\d+", text.replace(",", ""))
+    nums = NUM_RE.findall((text or "").replace(",", ""))
     if not nums:
         return None
     try:
         return sum(float(n) for n in nums)
     except Exception:
         return None
-
+async def try_fetch_with_scheme(url: str, timeout: int = 60_000):
+    normalized = ensure_scheme(url)
+    parsed = urlparse(normalized)
+    attempts = [normalized]
+    if parsed.scheme == "https":
+        attempts.append(urlunparse(parsed._replace(scheme="http")))
+    elif parsed.scheme == "http":
+        attempts.append(urlunparse(parsed._replace(scheme="https")))
+    last_err = None
+    for a in attempts:
+        try:
+            html = await fetch_rendered_html(a, timeout=timeout)
+            return html, a, None
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return None, None, last_err
 async def solve_quiz(url: str, email: str, secret: str) -> Dict[str, Any]:
-    
-
-    if "example-quiz.com" in url:
-        return {
-            "success": True,
-            "submit_url": "https://example-quiz.com/submit",
-            "answer_payload": {
-                "email": email,
-                "secret": secret,
-                "url": url,
-                "answer": 42
-            },
-            "submit_response": {
-                "status": "received",
-                "score": "pending"
-            }
-        }
-    
-    """
-    Main solver:
-    - render page
-    - extract encoded payloads
-    - try to find CSV/PDF or table and compute a numeric answer (sums)
-    - post answer JSON to submit endpoint (if found)
-    """
-    try:
-        html = await fetch_rendered_html(url)
-    except Exception as e:
-        return {"success": False, "message": f"Failed to render page: {e}"}
-
+    html, used_url, fetch_err = await try_fetch_with_scheme(url)
+    if html is None:
+        return {"success": False, "message": f"Failed to render page: {fetch_err} at {url}", "debug_attempted_url": used_url or url}
     decoded = decode_atob_from_html(html)
     full_text = html + "\n" + decoded
-
-    # Try to pull a submit URL from parsed JSON-like text
-    submit_url = _first_url_from_jsonlike(decoded) or _first_url_from_jsonlike(html) or extract_submit_url_from_text(full_text)
-
-    # parse any JSON answer if present
-    parsed_answer_from_json = None
-    m_json = re.search(r"\{[\s\S]{20,5000}\}", decoded) or re.search(r"\{[\s\S]{20,5000}\}", html)
-    if m_json:
-        try:
-            obj = json.loads(m_json.group(0))
-            if "answer" in obj:
-                parsed_answer_from_json = obj["answer"]
-        except Exception:
-            parsed_answer_from_json = None
-
-    # prepare BeautifulSoup
+    parsed_json = extract_json_from_text(decoded) or extract_json_from_text(html)
+    submit_url = ""
+    if parsed_json:
+        submit_url = parsed_json.get("submit") or parsed_json.get("submit_url") or parsed_json.get("url") or ""
+    if not submit_url:
+        submit_url = find_submit_url(full_text, base=used_url)
     soup = BeautifulSoup(html, "lxml")
-
-    # find file links (csv/pdf/xlsx) - prefer absolute via urljoin
+    pre_texts = [p.get_text() for p in soup.find_all("pre")]
+    for ptxt in pre_texts:
+        j = extract_json_from_text(ptxt)
+        if j:
+            parsed_json = j
+            if not submit_url:
+                submit_url = j.get("submit") or j.get("submit_url") or j.get("url") or submit_url
+            break
+    if not submit_url:
+        spans = soup.select(".origin")
+        if spans:
+            origins = [s.get_text(strip=True) for s in spans if s.get_text(strip=True)]
+            if origins:
+                candidate = origins[0]
+                if not candidate.startswith("http"):
+                    candidate = ensure_scheme(candidate)
+                submit_url = candidate.rstrip("/") + "/submit"
+    parsed_answer = None
+    if parsed_json and "answer" in parsed_json:
+        parsed_answer = parsed_json["answer"]
+    if parsed_answer is None:
+        for ptxt in pre_texts:
+            if "answer" in ptxt.lower():
+                j = extract_json_from_text(ptxt)
+                if j and "answer" in j:
+                    parsed_answer = j["answer"]
+                    break
     links = [a.get("href") for a in soup.find_all("a", href=True)]
     file_link = None
     for l in links:
@@ -171,24 +147,19 @@ async def solve_quiz(url: str, email: str, secret: str) -> Dict[str, Any]:
             continue
         low = l.lower().split("?")[0]
         if any(low.endswith(ext) for ext in [".csv", ".pdf", ".xlsx"]):
-            file_link = clean_link_candidate(l, url)
+            file_link = urljoin(used_url or url, l)
             break
-
-    answer: Optional[float] = None
-
+    answer: Optional[Any] = None
     async with httpx.AsyncClient() as client:
-        # If there's a CSV link, fetch & parse
         if file_link and file_link.lower().split("?")[0].endswith(".csv"):
             try:
-                txt = await _fetch_text_via_httpx(client, file_link)
+                txt = await _fetch_text(client, file_link)
                 import pandas as pd
                 df = pd.read_csv(io.StringIO(txt))
-                # try common column names
-                for cname in ["value", "Value", "val", "amount", "Amount", "total"]:
+                for cname in ["value", "Value", "val", "amount", "Amount", "total", "sum"]:
                     if cname in df.columns:
                         try:
-                            s = float(df[cname].sum())
-                            answer = s
+                            answer = float(df[cname].sum())
                             break
                         except Exception:
                             pass
@@ -196,14 +167,11 @@ async def solve_quiz(url: str, email: str, secret: str) -> Dict[str, Any]:
                     numeric_cols = df.select_dtypes(include="number").columns
                     if len(numeric_cols) > 0:
                         answer = float(df[numeric_cols[0]].sum())
-            except Exception as e:
-                # keep going, try other heuristics
+            except Exception:
                 pass
-
-        # PDF handling
         if file_link and file_link.lower().split("?")[0].endswith(".pdf") and answer is None:
             try:
-                b = await _fetch_bytes_via_httpx(client, file_link)
+                b = await _fetch_bytes(client, file_link)
                 text = None
                 if PdfReader:
                     try:
@@ -217,7 +185,6 @@ async def solve_quiz(url: str, email: str, secret: str) -> Dict[str, Any]:
                         text = "\n".join(pages_text)
                     except Exception:
                         text = None
-                # fallback: try crude ascii decode
                 if not text:
                     try:
                         text = b.decode("utf-8", errors="ignore")
@@ -229,8 +196,6 @@ async def solve_quiz(url: str, email: str, secret: str) -> Dict[str, Any]:
                         answer = float(s)
             except Exception:
                 pass
-
-        # If still nothing, try first HTML table on page
         if answer is None:
             tables = soup.find_all("table")
             if tables:
@@ -251,46 +216,27 @@ async def solve_quiz(url: str, email: str, secret: str) -> Dict[str, Any]:
                             answer = float(df[numeric_cols[0]].sum())
                 except Exception:
                     pass
-
-        # If parsed JSON provided answer, use it
-        if answer is None and parsed_answer_from_json is not None:
+        if answer is None and parsed_answer is not None:
             try:
-                answer = float(parsed_answer_from_json)
+                answer = float(parsed_answer)
             except Exception:
-                # if it's non-numeric, keep it as-is (string)
-                answer = parsed_answer_from_json
-
-        # As a last resort, try to sum numbers in decoded JS or page text
+                answer = parsed_answer
         if answer is None:
             s = sum_numbers_from_text(decoded or html)
             if s is not None:
                 answer = float(s)
-
-        # If still nothing, return helpful debug info
         if answer is None:
-            return {
-                "success": False,
-                "message": "Could not derive an answer automatically with default heuristics.",
-                "found_submit_url": submit_url,
-                "sample_text_excerpt": (full_text[:2000])
-            }
-
-        # Prepare payload and POST if we have a submit_url
-        answer_payload = {
-            "email": email,
-            "secret": secret,
-            "url": url,
-            "answer": answer
-        }
-
+            textual_hint = None
+            m = re.search(r'"answer"\s*:\s*"(.*?)"', full_text, flags=re.IGNORECASE|re.DOTALL)
+            if m:
+                textual_hint = m.group(1).strip()
+            if textual_hint:
+                answer = textual_hint
+        if answer is None:
+            return {"success": False, "message": "Could not derive an answer automatically with default heuristics.", "found_submit_url": submit_url, "sample_text_excerpt": full_text[:2000]}
+        answer_payload = {"email": email, "secret": secret, "url": url, "answer": answer}
         if not submit_url:
-            return {
-                "success": False,
-                "message": "No submit URL detected",
-                "answer_payload": answer_payload
-            }
-
-        # attempt to POST the answer
+            return {"success": False, "message": "No submit URL detected", "answer_payload": answer_payload}
         try:
             r = await client.post(submit_url, json=answer_payload, timeout=30)
             try:
@@ -299,10 +245,4 @@ async def solve_quiz(url: str, email: str, secret: str) -> Dict[str, Any]:
                 submit_response = {"status_code": r.status_code, "text": r.text}
         except Exception as e:
             return {"success": False, "message": f"Failed to POST answer: {e}", "answer_payload": answer_payload}
-
-    return {
-        "success": True,
-        "submit_url": submit_url,
-        "answer_payload": answer_payload,
-        "submit_response": submit_response
-    }
+    return {"success": True, "submit_url": submit_url, "answer_payload": answer_payload, "submit_response": submit_response}
